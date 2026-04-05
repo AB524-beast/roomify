@@ -1,8 +1,7 @@
-import { CheckCircle2, ImageIcon, UploadIcon } from 'lucide-react';
-import React, { useState, useRef, useCallback } from 'react';
+import { CheckCircle2, ImageIcon, UploadIcon, X } from 'lucide-react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { useOutletContext } from 'react-router';
 import { PROGRESS_INCREMENT, PROGRESS_INTERVAL_MS, REDIRECT_DELAY_MS } from '../lib/constants';
-// AuthContext type imported via useOutletContext
 
 interface UploadData {
   base64: string;
@@ -13,106 +12,149 @@ interface UploadProps {
   onComplete: (data: UploadData) => void;
 }
 
+interface AuthContextType {
+  isSignedIn: boolean;
+}
+
 const Upload: React.FC<UploadProps> = ({ onComplete }) => {
   const [file, setFile] = useState<File | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [progress, setProgress] = useState(0);
-  const uploadRef = useRef<HTMLDivElement>(null);
-  const { isSignedIn } = useOutletContext<AuthContext>();
+  const [error, setError] = useState<string | null>(null);
+  const { isSignedIn } = useOutletContext<AuthContextType>();
 
-  const resetStates = useCallback(() => {
-    setFile(null);
-    setProgress(0);
-    setIsDragging(false);
+  const timersRef = useRef<{ interval?: NodeJS.Timeout; timeout?: NodeJS.Timeout }>({});
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  // Cleanup timers and abort on unmount/new file
+  useEffect(() => {
+    return () => {
+      if (timersRef.current.interval) clearInterval(timersRef.current.interval);
+      if (timersRef.current.timeout) clearTimeout(timersRef.current.timeout);
+      if (abortControllerRef.current) abortControllerRef.current.abort();
+    };
   }, []);
+
+  useEffect(() => {
+    // Cleanup on new file selection
+    if (file) return;
+    if (timersRef.current.interval) clearInterval(timersRef.current.interval);
+    if (timersRef.current.timeout) clearTimeout(timersRef.current.timeout);
+    setProgress(0);
+    setError(null);
+  }, [file]);
+
+  const clearError = useCallback(() => setError(null), []);
 
   const processFile = useCallback((selectedFile: File) => {
     if (!isSignedIn) {
-      console.warn('User not signed in. Upload blocked.');
+      setError('Please sign in to upload files.');
       return;
     }
 
-    // Validate file: image, ~10MB
     if (!selectedFile.type.startsWith('image/')) {
-      alert('Please select a valid image file (JPG, PNG).');
+      setError('Please select a valid image file (JPG, PNG).');
       return;
     }
     if (selectedFile.size > 10 * 1024 * 1024) {
-      alert('File size exceeds 10MB limit.');
+      setError('File size exceeds 10MB limit.');
       return;
     }
 
     setFile(selectedFile);
+    setError(null);
+    setProgress(0);
 
+    abortControllerRef.current = new AbortController();
     const reader = new FileReader();
     reader.onload = () => {
+      if (abortControllerRef.current?.signal.aborted) return;
       const base64 = reader.result as string;
-      // Start progress simulation
+
       let prog = 0;
-      const interval = setInterval(() => {
+      timersRef.current.interval = setInterval(() => {
+        if (abortControllerRef.current?.signal.aborted) {
+          clearInterval(timersRef.current.interval!);
+          return;
+        }
         prog = Math.min(prog + PROGRESS_INCREMENT, 100);
         setProgress(prog);
         if (prog >= 100) {
-          clearInterval(interval);
-          setTimeout(() => {
+          clearInterval(timersRef.current.interval!);
+          timersRef.current.timeout = setTimeout(() => {
             onComplete({ base64, name: selectedFile.name });
-            // Optionally reset after complete
-            // resetStates();
           }, REDIRECT_DELAY_MS);
         }
       }, PROGRESS_INTERVAL_MS);
     };
+    reader.onerror = () => setError('Failed to read file.');
     reader.readAsDataURL(selectedFile);
   }, [isSignedIn, onComplete]);
 
+  const handleRemoveFile = useCallback(() => {
+    if (timersRef.current.interval) clearInterval(timersRef.current.interval);
+    if (timersRef.current.timeout) clearTimeout(timersRef.current.timeout);
+    if (abortControllerRef.current) abortControllerRef.current.abort();
+    setFile(null);
+    setProgress(0);
+    setError(null);
+  }, []);
+
   const handleDragOver = useCallback((e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
-    e.stopPropagation();
+    e.dataTransfer.effectAllowed = 'copy';
     if (!isSignedIn) return;
     setIsDragging(true);
   }, [isSignedIn]);
 
   const handleDragEnter = useCallback((e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
-    e.stopPropagation();
     if (!isSignedIn) return;
     setIsDragging(true);
   }, [isSignedIn]);
 
   const handleDragLeave = useCallback((e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
-    e.stopPropagation();
-    if (!isSignedIn) return;
+    // Only reset if leaving the dropzone entirely
+    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
     setIsDragging(false);
-  }, [isSignedIn]);
+  }, []);
 
   const handleDrop = useCallback((e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
-    e.stopPropagation();
     setIsDragging(false);
-    if (!isSignedIn || !e.dataTransfer.files?.[0]) return;
-    processFile(e.dataTransfer.files[0]);
+    const droppedFile = e.dataTransfer.files[0];
+    if (!isSignedIn || !droppedFile) return;
+    processFile(droppedFile);
   }, [isSignedIn, processFile]);
 
   const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
     if (selectedFile) {
-      e.target.value = ''; // Reset input
+      e.target.value = '';
       processFile(selectedFile);
     }
   }, [processFile]);
 
+  const dropzoneClasses = `dropzone ${isDragging ? 'is-dragging' : ''} ${!isSignedIn ? 'disabled' : ''}`;
+
   return (
     <div className='upload'>
+      {error && (
+        <div className="error-message">
+          <p>{error}</p>
+          <button onClick={clearError} className="error-dismiss">×</button>
+        </div>
+      )}
       {!file ? (
         <>
           <div
-            ref={uploadRef}
-            className={`dropzone ${isDragging ? 'is-dragging' : ''}`}
+            className={dropzoneClasses}
             onDragOver={handleDragOver}
             onDragEnter={handleDragEnter}
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
+            tabIndex={isSignedIn ? 0 : -1}
           >
             <input
               type="file"
@@ -129,9 +171,9 @@ const Upload: React.FC<UploadProps> = ({ onComplete }) => {
             <p>
               {isSignedIn
                 ? 'Drag and drop your floor plan here, or click to select a file.'
-                : 'Please log in to upload your floor plan.'}
+                : 'Upload disabled. Please log in to continue.'}
             </p>
-            <p className='help'>maximum File size 10 MB</p>
+            <p className='help'>Maximum file size 10 MB (JPG, PNG)</p>
           </div>
         </>
       ) : (
@@ -151,6 +193,9 @@ const Upload: React.FC<UploadProps> = ({ onComplete }) => {
                 {progress < 100 ? 'Analyzing floor plan...' : 'Redirecting...'}
               </p>
             </div>
+            <button onClick={handleRemoveFile} className="remove-file" disabled={progress === 100}>
+              <X size={16} /> Change file
+            </button>
           </div>
         </div>
       )}
@@ -159,4 +204,3 @@ const Upload: React.FC<UploadProps> = ({ onComplete }) => {
 };
 
 export default Upload;
-
